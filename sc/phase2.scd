@@ -94,6 +94,7 @@ s.options.memSize = 32768;
 ~eng = { ~engines[~focus] };          // the focused engine
 ~menuUntil = 0; ~menuHold = 1.2;      // engine-select overlay timer
 ~stepIdx = 0;                         // master 16th-note step 0..15
+~subDiv = 4; ~subPhase = 0;           // looper sub-ticks per 16th -> 1/64-note automation resolution
 ~bpm = 110; ~clock = TempoClock(~bpm / 60);
 
 // ================= OLED focus/overlay system =================
@@ -198,6 +199,12 @@ s.options.memSize = 32768;
     self[\build] = { |g, b| self[\grp] = g; self[\obus] = b; };
     self[\step]  = { |step| };                    // no sequencer yet
     self[\reset] = { };
+    self[\panic] = {                              // release any sounding voice — called on focus-out
+        if(self[\grp].notNil) { self[\grp].set(\gate, 0) };   // group .set releases every voice in it (rel env, no click)
+        ~note = nil; ~pending = false; ~sounding = false; ~press = 0;
+    };
+    self[\tick]    = { };                         // no looper on VOICE (sub-tick clock hooks, no-op)
+    self[\advance] = { };
     self[\rotary] = { |idx, d|
         case
         { idx == 0 } {
@@ -317,8 +324,13 @@ s.options.memSize = 32768;
         sampSeq: Array.fill(16, 0),
         preBus:  nil,                            // slices -> preBus -> \glitchFx -> \djfilter -> obus
         gBus:    nil,
-        // XY glitch-pad state: X=density, Y=flavor, pressure=wet, touch=engage
-        padOn: false, wet: 0, density: 0, flavor: 0.5
+        // XY glitch-pad state: Y=mangle (density+flavor), pressure=wet, touch=engage
+        padOn: false, wet: 0, density: 0, flavor: 0.5,
+        // ---- M-A looper: X automation lane driving the DJ filter; 1 bar @ subDiv=4 = 64 sub-ticks ----
+        loopBars: 1, loopSubs: 64, loopSub: 0,
+        xLane: FloatArray.newClear(256),         // pre-alloc MAX (4 bars); only 0..loopSubs-1 used
+        xWritten: false, recording: false, liveX: 0.5,
+        sweepDepth: 1.0, lastSentPos: -1.0
     );
     self[\build] = { |g, b|
         self[\grp] = g; self[\obus] = b;
@@ -340,9 +352,31 @@ s.options.memSize = 32768;
         };
         ~dirty = true;                                          // animate the playhead when focused
     };
-    self[\reset] = {                                            // back to the default straight groove
+    self[\reset] = {                                            // back to the default straight groove + loop phase
         16.do { |i| self[\state][\playSeq][i] = i; self[\state][\sampSeq][i] = 0 };
+        self[\state][\loopSub] = 0;
     };
+    self[\clear] = { self[\state][\xWritten] = false; };        // drop recorded automation (keeps groove)
+    self[\panic] = {                                            // focus-out: disarm record + drop the glitch pad
+        self[\state][\recording] = false;
+        self[\state][\padOn] = false; self[\state][\wet] = 0;
+        if(~breakGlitch.notNil) { ~breakGlitch.set(\wet, 0) };
+    };
+    // ---- looper sub-tick: SOLE writer of the DJ-filter pos (knob base + recorded X offset) ----
+    self[\tick] = {
+        var st = self[\state];
+        var ls = st[\loopSub];
+        var xv, pos;
+        if(st[\recording]) { st[\xLane][ls] = st[\liveX] };     // commit live X into the lane
+        xv  = if(st[\recording] or: { st[\xWritten] }) { st[\xLane][ls] } { 0.5 };
+        pos = (~djPos + ((xv - 0.5) * st[\sweepDepth])).clip(0, 1);
+        if((pos - st[\lastSentPos]).abs > 0.001) {              // change-check: idle loop sends nothing
+            if(~breakFilt.notNil) { ~breakFilt.set(\pos, pos) };
+            st[\lastSentPos] = pos;
+        };
+        ~tele.sendMsg("/loop", ls, pos.asFloat, xv.asFloat, if(st[\recording], 1, 0));  // looper eyes (port 9000)
+    };
+    self[\advance] = { self[\state][\loopSub] = (self[\state][\loopSub] + 1) % self[\state][\loopSubs] };
     self[\rotary] = { |idx, d|
         case
         { idx == 0 } {                                          // TEMPO (top-left)
@@ -355,16 +389,21 @@ s.options.memSize = 32768;
             ~djPos = (~djPos + (d * ~step)).clip(0, 1);
             ~djVel = (~djVel + (d * ~kick)).clip(~velCap.neg, ~velCap);
             ~spinNorm = (~djVel.abs / ~velCap).clip(0, 1);
-            if(~breakFilt.notNil) { ~breakFilt.set(\pos, ~djPos) };
+            // node no longer set here — the looper sub-tick is the sole writer of \pos
             ~showFocus.("DJFILT", ~djPos, ~djLabel.(~djPos), true);
         };
     };
     self[\pot]    = { |idx, v| };                               // M4 (drive/glitch land here)
     // ---- grid = Kaoss glitch pad: X = density, Y = flavor, pressure = wet, touch = engage ----
     self[\gridTouch] = { |down|
-        self[\state][\padOn] = down;
-        if(down.not) {
-            self[\state][\wet] = 0;
+        var st = self[\state];
+        st[\padOn] = down;
+        if(down) {
+            if(st[\xWritten].not) { st[\xLane].fill(0.5) };     // first-activation pre-fill: unrecorded = filter thru
+            st[\recording] = true;                              // arm: sub-tick commits liveX into the lane
+        } {
+            st[\recording] = false; st[\xWritten] = true;       // release: recorded lane now plays back + loops
+            st[\wet] = 0;
             if(~breakGlitch.notNil) { ~breakGlitch.set(\wet, 0) };
         };
         ~dirty = true;
@@ -375,9 +414,11 @@ s.options.memSize = 32768;
         ~dirty = true;
     };
     self[\gridPos] = { |x, y|
-        self[\state][\density] = (x / 10).clip(0, 1);
-        self[\state][\flavor]  = (y / 10).clip(0, 1);
-        if(~breakGlitch.notNil) { ~breakGlitch.set(\density, self[\state][\density], \flavor, self[\state][\flavor]) };
+        var st = self[\state];
+        st[\liveX]   = (x / 10).clip(0, 1);                    // X -> DJ-filter sweep lane (recorded)
+        st[\density] = (y / 10).clip(0, 1);                    // Y -> mangle (density + flavor together)
+        st[\flavor]  = (y / 10).clip(0, 1);
+        if(~breakGlitch.notNil) { ~breakGlitch.set(\density, st[\density], \flavor, st[\flavor]) };
         ~dirty = true;
     };
     self[\drawPlay] = {
@@ -401,6 +442,15 @@ s.options.memSize = 32768;
 };
 
 ~engines = [ ~makeVoiceEngine.(), ~makeBreakSlicer.() ];
+
+// Change focus, releasing the OUTGOING engine's sounding notes first. Without this a held
+// VOICE note is orphaned on switch (its gate never drops), the \voice node leaks, and the
+// accumulating DSP load starves the OLED/touch loop. Routes both focus paths (enc3 + harness).
+~setFocus = { |idx|
+    var target = idx.wrap(0, ~engines.size - 1).asInteger;
+    if(target != ~focus) { ~eng.()[\panic].(); ~focus = target; };
+    ~showEngineMenu.(); ~dirty = true;
+};
 
 // ================= boot =================
 s.waitForBoot({
@@ -523,7 +573,7 @@ s.waitForBoot({
         var idx = msg[1], d = msg[2];
         if(idx == 3) {
             var steps = ~detStep.(3, d);
-            if(steps != 0) { ~focus = (~focus + steps).wrap(0, ~engines.size - 1); ~showEngineMenu.() };
+            if(steps != 0) { ~setFocus.(~focus + steps) };
         } {
             ~eng.()[\rotary].(idx, d);
         };
@@ -557,7 +607,8 @@ s.waitForBoot({
 
     // ---- transport + per-engine mix (global) ----
     OSCdef(\tuneBpm,   { |msg| ~bpm = msg[1].clip(40, 220); ~clock.tempo = ~bpm / 60; ("bpm=" ++ ~bpm).postln }, '/tune/bpm');
-    OSCdef(\tuneReset, { |msg| ~stepIdx = 0; ~engines.do { |e| e[\reset].() }; "reset".postln }, '/tune/reset');
+    OSCdef(\tuneReset, { |msg| ~stepIdx = 0; ~subPhase = 0; ~engines.do { |e| e[\reset].() }; "reset".postln }, '/tune/reset');
+    OSCdef(\breakClear, { |msg| ~engines[1][\clear].(); "break clear".postln }, '/tune/breakclear');
     OSCdef(\lvVoice,   { |msg| ~mixer.set(\lvVoice, msg[1].clip(0, 2)); ("lvVoice=" ++ msg[1]).postln }, '/tune/lvvoice');
     OSCdef(\lvBreak,   { |msg| ~mixer.set(\lvBreak, msg[1].clip(0, 2)); ("lvBreak=" ++ msg[1]).postln }, '/tune/lvbreak');
 
@@ -576,7 +627,7 @@ s.waitForBoot({
     OSCdef(\hFocus, { |msg|
         var target = msg[1].asSymbol;
         var idx = ~engines.detectIndex({ |e| e[\name].asSymbol == target });
-        if(idx.notNil) { ~focus = idx; ~showEngineMenu.(); ~dirty = true; ("harness focus " ++ target ++ " (idx " ++ idx ++ ")").postln }
+        if(idx.notNil) { ~setFocus.(idx); ("harness focus " ++ target ++ " (idx " ++ idx ++ ")").postln }
                        { ("harness focus: no engine '" ++ target ++ "'").postln };
     }, '/harness/focus');
     // Record the master output (bus 0) to /dev/shm (root FS is full); harness pulls it back.
@@ -594,9 +645,14 @@ s.waitForBoot({
     // ---- master 16th-note clock: drives every engine's step in lockstep ----
     ~stepTask = Routine({
         loop {
-            ~engines.do { |e| e[\step].(~stepIdx) };
-            ~stepIdx = (~stepIdx + 1) % 16;
-            0.25.wait;                            // 1/16 note = 0.25 beat (tempo-correct)
+            ~engines.do { |e| e[\tick].() };                  // looper sub-tick FIRST (read lane, push filter)
+            if(~subPhase == 0) {                               // real 16th on the sub-phase downbeat
+                ~engines.do { |e| e[\step].(~stepIdx) };
+                ~stepIdx = (~stepIdx + 1) % 16;
+            };
+            ~engines.do { |e| e[\advance].() };                // advance loop counters LAST
+            ~subPhase = (~subPhase + 1) % ~subDiv;
+            (0.25 / ~subDiv).wait;                             // 1/64 note (subDiv sub-ticks per 16th)
         };
     }).play(~clock);
 
@@ -625,7 +681,7 @@ s.waitForBoot({
                 if((~djPos <= 0) or: { ~djPos >= 1 }) { ~djVel = 0 };
                 ~djVel = ~djVel * ~friction;
                 if(~djVel.abs <= ~velEps) { ~djVel = 0 };
-                if(~breakFilt.notNil) { ~breakFilt.set(\pos, ~djPos) };
+                // node no longer set here — the looper sub-tick coasts \pos from ~djPos
                 if(~focus == 1) { ~spinNorm = (~djVel.abs / ~velCap).clip(0, 1);
                                   ~showFocus.("DJFILT", ~djPos, ~djLabel.(~djPos), true) };
             };
