@@ -1,0 +1,19 @@
+[Unit]
+Description=Open XSynth - OSC control relay (8001 -> 57120)
+After=xsynth-instrument.service
+# Wants (not Requires): the relay is a stateless UDP forwarder, so it should keep
+# running across an instrument crash/restart (the new sclang re-binds 57120 and
+# forwarding resumes). Requires would tear the relay down with the instrument.
+Wants=xsynth-instrument.service
+
+[Service]
+Type=simple
+User=pi
+# Don't forward into SC until it has booted + registered its OSCdefs (posts READY).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 40); do grep -q READY /tmp/scosc.log 2>/dev/null && exit 0; sleep 1; done; exit 0'
+ExecStart=/usr/bin/python3 /home/pi/osc_relay.py 8001 57120
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

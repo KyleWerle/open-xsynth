@@ -21,8 +21,13 @@ class OledScreenDriver{
 	public:
 		// Sends the initial configuration to the screen.
 		bool setup(int i2cFd, uint8_t address, int resetPin=-1);
-		// Draws a 128x64 frame buffer on the screen.
+		// Draws a 128x64 frame buffer on the screen. Skips the (slow) I2C
+		// transfer when the packed frame is identical to the last one sent.
 		void draw(ofFbo &fbo);
+		// Sets the display contrast / brightness (0-255).
+		void setBrightness(uint8_t value);
+		// Inverts the display (white<->black).
+		void setInvert(bool invert);
 
 	private:
 		// Resets the screen by driving a GPIO reset pin low.
@@ -31,4 +36,7 @@ class OledScreenDriver{
 		int i2cFd;
 		// The I2C address of the screen.
 		uint8_t address;
+		// Last packed frame sent (8 segments x 128 columns), for dirty-check.
+		uint8_t lastFrame[1024];
+		bool haveLast = false;
 };

@@ -18,6 +18,7 @@ limitations under the License.
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <string.h>
 
 
 bool OledScreenDriver::setup(int i2cFd_, uint8_t address_, int resetPin){
@@ -64,40 +65,41 @@ void OledScreenDriver::draw(ofFbo &fbo){
 	if(i2cFd < 0){
 		return;
 	}
-	if(ioctl(i2cFd, I2C_SLAVE, address) < 0){
-		return;
-	}
 
 	ofPixels pixels;
 	fbo.readToPixels(pixels);
 
-	uint8_t buf[129];
-
-	// Write data command.
-	buf[0] = 64;
-
+	// Pack the frame into 8 segments x 128 columns (one bit per pixel).
+	uint8_t cur[1024];
 	int pixelIdx = 0;
 	for(int seg=0; seg<8; ++seg){
-		// The screen is drawn in 8 horizontal segments.
-		// Each segment is 128x8 pixels.
-		// Each byte represents one column.
-
-		// Clear the buffer first.
-		for(unsigned int x=1; x<sizeof(buf); ++x){
-			buf[x] = 0;
+		for(int x=0; x<128; ++x){
+			cur[seg*128 + x] = 0;
 		}
-
-		// Traverse the 8 rows.
 		for(int y=0; y<8; ++y){
 			for(int x=0; x<128; ++x){
 				int set = pixels[pixelIdx] >= 127;
-				buf[x+1] |= set << y;
+				cur[seg*128 + x] |= set << y;
 				pixelIdx += 4;
 			}
 		}
+	}
 
+	// Dirty-check: skip the expensive I2C transfer if nothing changed.
+	if(haveLast && memcmp(cur, lastFrame, sizeof(cur)) == 0){
+		return;
+	}
+
+	if(ioctl(i2cFd, I2C_SLAVE, address) < 0){
+		return;
+	}
+
+	uint8_t buf[129];
+	buf[0] = 64;  // write-data command
+	for(int seg=0; seg<8; ++seg){
+		memcpy(buf + 1, cur + seg*128, 128);
 		if(write(i2cFd, buf, sizeof(buf)) != sizeof(buf)){
-			break;
+			return;  // don't cache a partial write
 		}
 	}
 
@@ -105,10 +107,36 @@ void OledScreenDriver::draw(ofFbo &fbo){
 	static uint8_t flush[] = {
 		0, 175
 	};
-
 	if(write(i2cFd, flush, sizeof(flush)) != sizeof(flush)){
 		return;
 	}
+
+	memcpy(lastFrame, cur, sizeof(cur));
+	haveLast = true;
+}
+
+
+void OledScreenDriver::setBrightness(uint8_t value){
+	if(i2cFd < 0){
+		return;
+	}
+	if(ioctl(i2cFd, I2C_SLAVE, address) < 0){
+		return;
+	}
+	uint8_t cmd[3] = {0x00, 0x81, value};  // command stream, set contrast
+	write(i2cFd, cmd, sizeof(cmd));
+}
+
+
+void OledScreenDriver::setInvert(bool invert){
+	if(i2cFd < 0){
+		return;
+	}
+	if(ioctl(i2cFd, I2C_SLAVE, address) < 0){
+		return;
+	}
+	uint8_t cmd[2] = {0x00, static_cast<uint8_t>(invert ? 0xA7 : 0xA6)};
+	write(i2cFd, cmd, sizeof(cmd));
 }
 
 

@@ -1,0 +1,31 @@
+[Unit]
+Description=Open XSynth - bundled audio stack (JACK + SuperCollider instrument)
+After=open-xsynth.service sound.target
+Wants=open-xsynth.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+# jackd needs an existing runtime dir or it silently creates no socket; logind
+# only makes /run/user/<uid> on login, so give it a systemd-guaranteed one.
+RuntimeDirectory=xsynth
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Environment=XDG_RUNTIME_DIR=/run/xsynth
+Environment=JACK_NO_AUDIO_RESERVATION=1
+Environment=QT_QPA_PLATFORM=offscreen
+# RT scheduling + memlock for BOTH jackd and scsynth (children of the wrapper);
+# systemd ignores PAM @audio limits, so set them on the unit.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+# The wrapper starts jackd, waits for it, boots sclang/scsynth, then watchdogs all
+# three — if any dies it exits and we restart the whole stack with a fresh jackd.
+ExecStart=/home/pi/xsynth-stack.sh
+Restart=always
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
