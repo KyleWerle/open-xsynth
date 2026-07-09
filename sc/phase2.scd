@@ -327,11 +327,19 @@ s.options.memSize = 32768;
         gBus:    nil,
         // XY glitch-pad state: Y=mangle (density+flavor), pressure=wet, touch=engage
         padOn: false, wet: 0, density: 0, flavor: 0.5,
-        // ---- M-A looper: X automation lane driving the DJ filter; 1 bar @ subDiv=4 = 64 sub-ticks ----
+        // ---- looper (M-A/M-B): 3 smooth automation lanes @ subDiv=4; 1 bar = 64 sub-ticks ----
         loopBars: 1, loopSubs: 64, loopSub: 0,
-        xLane: FloatArray.newClear(256),         // pre-alloc MAX (4 bars); only 0..loopSubs-1 used
-        xWritten: false, recording: false, liveX: 0.5,
-        sweepDepth: 1.0, lastSentPos: -1.0
+        xLane:   FloatArray.newClear(256),       // X -> DJ-filter sweep   (base 0.5 = thru)
+        yLane:   FloatArray.newClear(256),       // Y -> glitch mangle     (base 0)
+        prsLane: FloatArray.newClear(256),       // pressure -> glitch wet (base 0)
+        xWritten: false, yWritten: false, prsWritten: false,
+        recording: false,
+        liveX: 0.5, liveY: 0, livePrs: 0,
+        // per-lane punch-in: baselines (nil until captured) + active flags (write only ACTIVE lanes = overdub)
+        xAtTouch: nil, yAtTouch: nil, prsAtTouch: nil, touchT: 0,
+        xActive: false, yActive: false, prsActive: false,
+        sweepDepth: 1.0, lastSentPos: -1.0, lastY: -1.0, lastWet: -1.0,
+        dispX: 0.5, dispY: 0                     // resolved values for the OLED dot (live or playback)
     );
     self[\build] = { |g, b|
         self[\grp] = g; self[\obus] = b;
@@ -357,25 +365,39 @@ s.options.memSize = 32768;
         16.do { |i| self[\state][\playSeq][i] = i; self[\state][\sampSeq][i] = 0 };
         self[\state][\loopSub] = 0;
     };
-    self[\clear] = { self[\state][\xWritten] = false; };        // drop recorded automation (keeps groove)
-    self[\panic] = {                                            // focus-out: disarm record + drop the glitch pad
-        self[\state][\recording] = false;
-        self[\state][\padOn] = false; self[\state][\wet] = 0;
-        if(~breakGlitch.notNil) { ~breakGlitch.set(\wet, 0) };
+    self[\clear] = {                                            // drop ALL recorded automation (keeps groove)
+        var st = self[\state];
+        st[\xWritten] = false; st[\yWritten] = false; st[\prsWritten] = false;
     };
-    // ---- looper sub-tick: SOLE writer of the DJ-filter pos (knob base + recorded X offset) ----
+    self[\panic] = {                                            // focus-out: disarm record; sub-tick handles the FX
+        var st = self[\state];
+        st[\recording] = false; st[\padOn] = false; st[\livePrs] = 0;
+        st[\xActive] = false; st[\yActive] = false; st[\prsActive] = false;
+    };
+    // ---- looper sub-tick: SOLE writer of all break FX. Per lane: live-if-active-this-pass, else
+    //      recorded-if-written, else base. Only ACTIVE lanes are written this pass (overdub-safe). ----
     self[\tick] = {
         var st = self[\state];
         var ls = st[\loopSub];
-        var xv, pos;
-        if(st[\recording]) { st[\xLane][ls] = st[\liveX] };     // commit live X into the lane
-        xv  = if(st[\recording] or: { st[\xWritten] }) { st[\xLane][ls] } { 0.5 };
+        var rec = st[\recording];
+        var xv, yv, pv, pos;
+        if(rec and: { st[\xActive]   }) { st[\xLane][ls]   = st[\liveX]   };
+        if(rec and: { st[\yActive]   }) { st[\yLane][ls]   = st[\liveY]   };
+        if(rec and: { st[\prsActive] }) { st[\prsLane][ls] = st[\livePrs] };
+        xv = if(rec and: { st[\xActive]   }) { st[\liveX]   } { if(st[\xWritten])   { st[\xLane][ls]   } { 0.5 } };
+        yv = if(rec and: { st[\yActive]   }) { st[\liveY]   } { if(st[\yWritten])   { st[\yLane][ls]   } { 0.0 } };
+        pv = if(rec and: { st[\prsActive] }) { st[\livePrs] } { if(st[\prsWritten]) { st[\prsLane][ls] } { 0.0 } };
         pos = (~djPos + ((xv - 0.5) * st[\sweepDepth])).clip(0, 1);
-        if((pos - st[\lastSentPos]).abs > 0.001) {              // change-check: idle loop sends nothing
+        if((pos - st[\lastSentPos]).abs > 0.001) {
             if(~breakFilt.notNil) { ~breakFilt.set(\pos, pos) };
             st[\lastSentPos] = pos;
         };
-        if(~subPhase == 0) { ~tele.sendMsg("/loop", ls, pos.asFloat, xv.asFloat, if(st[\recording], 1, 0)) };  // looper eyes, downbeat only
+        if(((yv - st[\lastY]).abs > 0.002) or: { (pv - st[\lastWet]).abs > 0.002 }) {   // Y->mangle, prs->wet
+            if(~breakGlitch.notNil) { ~breakGlitch.set(\density, yv, \flavor, yv, \wet, pv) };
+            st[\lastY] = yv; st[\lastWet] = pv;
+        };
+        st[\dispX] = xv; st[\dispY] = yv; st[\wet] = pv;        // for the OLED dot + wet bar
+        if(~subPhase == 0) { ~tele.sendMsg("/loop", ls, pos.asFloat, yv.asFloat, pv.asFloat, if(rec, 1, 0)) };  // eyes
     };
     self[\advance] = { self[\state][\loopSub] = (self[\state][\loopSub] + 1) % self[\state][\loopSubs] };
     self[\rotary] = { |idx, d|
@@ -399,41 +421,55 @@ s.options.memSize = 32768;
     self[\gridTouch] = { |down|
         var st = self[\state];
         st[\padOn] = down;
-        if(down) {
-            if(st[\xWritten].not) { st[\xLane].fill(0.5) };     // first-activation pre-fill: unrecorded = filter thru
-            st[\recording] = true;                              // arm: sub-tick commits liveX into the lane
-        } {
-            st[\recording] = false; st[\xWritten] = true;       // release: recorded lane now plays back + loops
-            st[\wet] = 0;
-            if(~breakGlitch.notNil) { ~breakGlitch.set(\wet, 0) };
+        if(down) {                                              // arm record; baselines captured lazily
+            st[\recording] = true; st[\touchT] = Main.elapsedTime;
+            st[\xAtTouch] = nil; st[\yAtTouch] = nil; st[\prsAtTouch] = nil;
+            st[\xActive] = false; st[\yActive] = false; st[\prsActive] = false;
+            if(st[\xWritten].not)   { st[\xLane].fill(0.5) };   // pre-fill unwritten lanes with base so a partial
+            if(st[\yWritten].not)   { st[\yLane].fill(0.0) };   // pass reads base, not newClear zeros
+            if(st[\prsWritten].not) { st[\prsLane].fill(0.0) };
+        } {                                                     // release: commit only the lanes that moved this pass
+            st[\recording] = false; st[\livePrs] = 0;
+            if(st[\xActive])   { st[\xWritten] = true };
+            if(st[\yActive])   { st[\yWritten] = true };
+            if(st[\prsActive]) { st[\prsWritten] = true };
+            st[\xActive] = false; st[\yActive] = false; st[\prsActive] = false;
         };
         ~dirty = true;
     };
     self[\gridPressure] = { |p|
-        self[\state][\wet] = if(self[\state][\padOn]) { p.clip(0, 1) } { 0 };
-        if(~breakGlitch.notNil) { ~breakGlitch.set(\wet, self[\state][\wet]) };
+        var st = self[\state];
+        st[\livePrs] = p.clip(0, 1);                            // sub-tick reads this; no direct .set
+        if(st[\recording]) {                                    // baseline ~150ms in (pressure rises from 0 on touch)
+            if(st[\prsAtTouch].isNil and: { (Main.elapsedTime - st[\touchT]) > 0.15 }) { st[\prsAtTouch] = st[\livePrs] };
+            if(st[\prsAtTouch].notNil and: { (st[\livePrs] - st[\prsAtTouch]).abs > 0.08 }) { st[\prsActive] = true };
+        };
         ~dirty = true;
     };
     self[\gridPos] = { |x, y|
         var st = self[\state];
-        st[\liveX]   = (x / 10).clip(0, 1);                    // X -> DJ-filter sweep lane (recorded)
-        st[\density] = (y / 10).clip(0, 1);                    // Y -> mangle (density + flavor together)
-        st[\flavor]  = (y / 10).clip(0, 1);
-        if(~breakGlitch.notNil) { ~breakGlitch.set(\density, st[\density], \flavor, st[\flavor]) };
+        st[\liveX] = (x / 10).clip(0, 1);                       // sub-tick reads these; no direct .set
+        st[\liveY] = (y / 10).clip(0, 1);
+        if(st[\recording]) {                                    // lazy baseline on first pos after touch (last pos is stale)
+            if(st[\xAtTouch].isNil) { st[\xAtTouch] = st[\liveX] };
+            if(st[\yAtTouch].isNil) { st[\yAtTouch] = st[\liveY] };
+            if((st[\liveX] - st[\xAtTouch]).abs > 0.03) { st[\xActive] = true };
+            if((st[\liveY] - st[\yAtTouch]).abs > 0.03) { st[\yActive] = true };
+        };
         ~dirty = true;
     };
     self[\drawPlay] = {
         var st = self[\state];
         var bx = 6, by = 15, bw = 74, bh = 44;                          // XY pad box
-        var fname = case { st[\flavor] < 0.34 } { "CRUSH" } { st[\flavor] > 0.66 } { "SPACE" } { true } { "GATE" };
-        var dotx = (bx + 1 + (st[\liveX]  * (bw - 5))).asInteger;       // finger X (filter sweep)
-        var doty = (by + 1 + (st[\flavor] * (bh - 5))).asInteger;       // finger Y (mangle) — grows DOWN to match the grid
+        var fname = case { st[\dispY] < 0.34 } { "CRUSH" } { st[\dispY] > 0.66 } { "SPACE" } { true } { "GATE" };
+        var dotx = (bx + 1 + (st[\dispX] * (bw - 5))).asInteger;        // X = filter sweep (live or looping)
+        var doty = (by + 1 + (st[\dispY] * (bh - 5))).asInteger;        // Y = mangle, grows DOWN to match the grid
         ~oled.sendMsg("/oled/clear");
         ~oled.sendMsg("/oled/rect", 0, 0, 127, 63, 0);
         ~oled.sendMsg("/oled/text", 4, 10, "BRK " ++ ~bpm);
         ~oled.sendMsg("/oled/rect", bx, by, bw, bh, 0);                 // pad border
         ~oled.sendMsg("/oled/rect", dotx, doty, 4, 4, 1);               // XY finger dot: X=filter, Y=mangle
-        ~oled.sendMsg("/oled/text", 88, 22, if(st[\padOn]) { fname } { "idle" });
+        ~oled.sendMsg("/oled/text", 88, 22, if(st[\padOn] or: { st[\yWritten] }) { fname } { "idle" });
         ~oled.sendMsg("/oled/text", 88, 40, "wet");
         ~oled.sendMsg("/oled/bar", 88, 46, 34, 7, st[\wet]);
         ~oled.sendMsg("/oled/rect", bx + (~stepIdx * (bw / 16)).asInteger, by + bh + 2, 3, 2, 1);  // playhead tick
