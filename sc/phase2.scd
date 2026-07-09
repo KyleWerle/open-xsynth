@@ -32,6 +32,7 @@ s.options.memSize = 32768;
 ~oled = NetAddr("127.0.0.1", 8000);
 ~tele = NetAddr("127.0.0.1", 9000);   // control-side telemetry (clients/tele_monitor.py)
 ~fft  = NetAddr("127.0.0.1", 9001);   // audio-side analysis (clients/fft_monitor.py)
+~anlzOn = false;                      // \analyzer FFT scope OFF by default — telemetry-only, bursty FFT/7-BPF cost; /tune/anlz 1 to enable for tuning
 
 // ================= shared musical config =================
 ~note = nil;                          // VOICE state stays global (single voice, tuned; low-risk)
@@ -374,7 +375,7 @@ s.options.memSize = 32768;
             if(~breakFilt.notNil) { ~breakFilt.set(\pos, pos) };
             st[\lastSentPos] = pos;
         };
-        ~tele.sendMsg("/loop", ls, pos.asFloat, xv.asFloat, if(st[\recording], 1, 0));  // looper eyes (port 9000)
+        if(~subPhase == 0) { ~tele.sendMsg("/loop", ls, pos.asFloat, xv.asFloat, if(st[\recording], 1, 0)) };  // looper eyes, downbeat only
     };
     self[\advance] = { self[\state][\loopSub] = (self[\state][\loopSub] + 1) % self[\state][\loopSubs] };
     self[\rotary] = { |idx, d|
@@ -565,7 +566,7 @@ s.waitForBoot({
     ~mixer = Synth.tail(s.defaultGroup, \mixer, [
         \voiceBus, ~engines[0][\obus].index, \breakBus, ~engines[1][\obus].index
     ]);
-    ~analyzer = Synth.tail(s.defaultGroup, \analyzer);
+    ~analyzer = if(~anlzOn) { Synth.tail(s.defaultGroup, \analyzer) };  // scope off by default (Pi 3 headroom); /tune/anlz toggles
     OSCdef(\anlz, { |msg| ~fft.sendMsg("/fft", *(msg[3..])) }, '/anlz');
 
     // ---- input dispatch: ONE OSCdef per address -> focused engine (enc3 = global select) ----
@@ -609,6 +610,12 @@ s.waitForBoot({
     OSCdef(\tuneBpm,   { |msg| ~bpm = msg[1].clip(40, 220); ~clock.tempo = ~bpm / 60; ("bpm=" ++ ~bpm).postln }, '/tune/bpm');
     OSCdef(\tuneReset, { |msg| ~stepIdx = 0; ~subPhase = 0; ~engines.do { |e| e[\reset].() }; "reset".postln }, '/tune/reset');
     OSCdef(\breakClear, { |msg| ~engines[1][\clear].(); "break clear".postln }, '/tune/breakclear');
+    OSCdef(\tuneAnlz, { |msg|                                  // FFT telemetry scope on/off (off = Pi 3 headroom)
+        var on = msg[1] > 0;
+        if(on and: { ~analyzer.isNil }) { ~analyzer = Synth.tail(s.defaultGroup, \analyzer) };
+        if(on.not and: { ~analyzer.notNil }) { ~analyzer.free; ~analyzer = nil };
+        ~anlzOn = on; ("analyzer=" ++ on).postln;
+    }, '/tune/anlz');
     OSCdef(\lvVoice,   { |msg| ~mixer.set(\lvVoice, msg[1].clip(0, 2)); ("lvVoice=" ++ msg[1]).postln }, '/tune/lvvoice');
     OSCdef(\lvBreak,   { |msg| ~mixer.set(\lvBreak, msg[1].clip(0, 2)); ("lvBreak=" ++ msg[1]).postln }, '/tune/lvbreak');
 
