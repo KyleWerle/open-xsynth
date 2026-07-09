@@ -426,13 +426,13 @@ s.options.memSize = 32768;
         var st = self[\state];
         var bx = 6, by = 15, bw = 74, bh = 44;                          // XY pad box
         var fname = case { st[\flavor] < 0.34 } { "CRUSH" } { st[\flavor] > 0.66 } { "SPACE" } { true } { "GATE" };
-        var dotx = (bx + 1 + (st[\density] * (bw - 5))).asInteger;
-        var doty = (by + bh - 5 - (st[\flavor] * (bh - 5))).asInteger;  // flavor grows UP
+        var dotx = (bx + 1 + (st[\liveX]  * (bw - 5))).asInteger;       // finger X (filter sweep)
+        var doty = (by + 1 + (st[\flavor] * (bh - 5))).asInteger;       // finger Y (mangle) — grows DOWN to match the grid
         ~oled.sendMsg("/oled/clear");
         ~oled.sendMsg("/oled/rect", 0, 0, 127, 63, 0);
         ~oled.sendMsg("/oled/text", 4, 10, "BRK " ++ ~bpm);
         ~oled.sendMsg("/oled/rect", bx, by, bw, bh, 0);                 // pad border
-        ~oled.sendMsg("/oled/rect", dotx, doty, 4, 4, 1);               // density(x) / flavor(y) dot
+        ~oled.sendMsg("/oled/rect", dotx, doty, 4, 4, 1);               // XY finger dot: X=filter, Y=mangle
         ~oled.sendMsg("/oled/text", 88, 22, if(st[\padOn]) { fname } { "idle" });
         ~oled.sendMsg("/oled/text", 88, 40, "wet");
         ~oled.sendMsg("/oled/bar", 88, 46, 34, 7, st[\wet]);
