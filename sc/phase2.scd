@@ -97,6 +97,8 @@ s.options.memSize = 32768;
 ~stepIdx = 0;                         // master 16th-note step 0..15
 ~subDiv = 2; ~subPhase = 0;           // looper sub-ticks per 16th -> 1/32 automation res (Pi 3 load; Lag smooths between)
 ~bpm = 110; ~clock = TempoClock(~bpm / 60);
+// Ableton Link (fed by the external linkbridge -> /link/state); lock tempo+phase only while peers > 0
+~linkTempo = 110; ~linkPhase = 0; ~linkPeers = 0; ~linkOn = false; ~linkLastT = 0; ~linkKp = 0.5;
 
 // ================= OLED focus/overlay system =================
 ~focusParam = nil;
@@ -402,10 +404,14 @@ s.options.memSize = 32768;
     self[\advance] = { self[\state][\loopSub] = (self[\state][\loopSub] + 1) % self[\state][\loopSubs] };
     self[\rotary] = { |idx, d|
         case
-        { idx == 0 } {                                          // TEMPO (top-left)
-            ~bpm = (~bpm + d).clip(40, 220); ~clock.tempo = ~bpm / 60;
-            if(~breakGlitch.notNil) { ~breakGlitch.set(\bpm, ~bpm) };
-            ~showFocus.("TEMPO", (~bpm - 40) / 180, ~bpm.asString ++ "bpm");
+        { idx == 0 } {                                          // TEMPO (top-left) — Link owns tempo when locked
+            if(~linkOn) {
+                ~showFocus.("TEMPO", (~bpm - 40) / 180, "LINK " ++ ~bpm.round);
+            } {
+                ~bpm = (~bpm + d).clip(40, 220); ~clock.tempo = ~bpm / 60;
+                if(~breakGlitch.notNil) { ~breakGlitch.set(\bpm, ~bpm) };
+                ~showFocus.("TEMPO", (~bpm - 40) / 180, ~bpm.asString ++ "bpm");
+            };
         }
         { idx == 1 } { }                                        // spare (top-right) — TODO
         { idx == 2 } {                                          // DJ FILTER (bottom-left) — cutoff flywheel feel
@@ -652,6 +658,30 @@ s.waitForBoot({
         if(on.not and: { ~analyzer.notNil }) { ~analyzer.free; ~analyzer = nil };
         ~anlzOn = on; ("analyzer=" ++ on).postln;
     }, '/tune/anlz');
+    // ---- Ableton Link: /link/state <tempo> <beat> <barPhase 0..1> <peers> from the bridge (50Hz) ----
+    OSCdef(\linkState, { |msg|
+        var tempo = msg[1], barPhase = msg[3], peers = msg[4];
+        var wasOn = ~linkOn;
+        var brk, loopSubs, xphase, err;
+        ~linkTempo = tempo; ~linkPhase = barPhase; ~linkPeers = peers;
+        ~linkLastT = Main.elapsedTime;
+        ~linkOn = peers > 0;
+        if(~linkOn) {
+            brk = ~engines[1][\state];
+            loopSubs = brk[\loopSubs];
+            xphase = brk[\loopSub] / loopSubs;                   // XSynth bar-phase 0..1
+            err = ((barPhase - xphase) + 0.5).mod(1.0) - 0.5;    // wrap to [-0.5, 0.5]
+            if(wasOn.not) {                                      // fresh lock: hard-snap the counters to Link's bar
+                var ls = (barPhase * loopSubs).round.asInteger.wrap(0, loopSubs - 1);
+                brk[\loopSub] = ls; ~stepIdx = (ls div: ~subDiv) % 16; ~subPhase = ls % ~subDiv; err = 0;
+                ("link LOCK @ " ++ tempo.round ++ "bpm, " ++ peers ++ " peer(s)").postln;
+            };
+            ~bpm = tempo;
+            ~clock.tempo = (tempo / 60) * (1 + (~linkKp * err)).clip(0.94, 1.06);  // match tempo + nudge phase
+            if(~breakGlitch.notNil) { ~breakGlitch.set(\bpm, tempo) };
+        };
+    }, '/link/state');
+    OSCdef(\tuneLinkKp, { |msg| ~linkKp = msg[1].clip(0, 4); ("linkKp=" ++ ~linkKp).postln }, '/tune/linkkp');
     OSCdef(\lvVoice,   { |msg| ~mixer.set(\lvVoice, msg[1].clip(0, 2)); ("lvVoice=" ++ msg[1]).postln }, '/tune/lvvoice');
     OSCdef(\lvBreak,   { |msg| ~mixer.set(\lvBreak, msg[1].clip(0, 2)); ("lvBreak=" ++ msg[1]).postln }, '/tune/lvbreak');
 
@@ -705,6 +735,7 @@ s.waitForBoot({
         var lastOled = 0, oledDt = 0.05;                      // OLED redraw cap ~20fps -> frees the shared i2c bus for grid reads
         loop {
             var now = Main.elapsedTime;
+            if(~linkOn and: { (now - ~linkLastT) > 1.0 }) { ~linkOn = false; ~clock.tempo = ~bpm / 60 };  // bridge gone -> free-run
             if(~focus == 0) {                                 // /tele is VOICE play-state; skip its work during BREAK
                 ~tele.sendMsg("/tele", ~press.asFloat, ~lastStrike.asFloat, ~yTone.asFloat,
                     ~cutPos.asFloat, ~p.cutoff.asFloat,

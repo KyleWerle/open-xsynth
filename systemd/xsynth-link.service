@@ -1,0 +1,14 @@
+[Unit]
+Description=Ableton Link -> OSC bridge for Open XSynth (feeds /link/state to sclang:57120)
+After=network.target xsynth-instrument.service
+Wants=xsynth-instrument.service
+
+[Service]
+Type=simple
+ExecStart=/home/pi/linkbridge/linkbridge 127.0.0.1 57120
+Restart=always
+RestartSec=2
+User=pi
+
+[Install]
+WantedBy=multi-user.target
