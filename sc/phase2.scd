@@ -69,6 +69,7 @@ s.options.memSize = 32768;
 ~djPos = 0.5; ~djVel = 0.0;           // 0.5 = bypass; <0.5 sweeps LP down; >0.5 sweeps HP up
 ~breakFilt = nil;                     // the persistent \djfilter synth (set at build)
 ~breakGlitch = nil;                   // the persistent \glitchFx synth (Kaoss XY pad target)
+~breakVca = nil;                      // the persistent \breakVca gain stage (M-C gate/kill; set at build)
 
 // ---- detent accumulators (shared; slots 0/1 = VOICE scale/root, 3 = engine-select) ----
 ~detAccum = [0, 0, 0, 0]; ~detDir = [0, 0, 0, 0]; ~detLastT = [0, 0, 0, 0]; ~detRate = [0, 0, 0, 0];
@@ -341,7 +342,12 @@ s.options.memSize = 32768;
         xAtTouch: nil, yAtTouch: nil, prsAtTouch: nil, touchT: 0,
         xActive: false, yActive: false, prsActive: false,
         sweepDepth: 1.0, lastSentPos: -1.0, lastY: -1.0, lastWet: -1.0,
-        dispX: 0.5, dispY: 0                     // resolved values for the OLED dot (live or playback)
+        dispX: 0.5, dispY: 0,                    // resolved values for the OLED dot (live or playback)
+        // ---- M-C gate/silence ----
+        vBus: nil,                               // djfilter -> \breakVca gain stage
+        gateFloor: 0.06, gateKnee: 0.6,          // pressure-gate curve: below floor = silent, above knee = full
+        inCorner: false, killEnterT: 0, killed: false,   // kill-corner: bottom-left dwell -> momentary hard mute
+        lastGain: -1.0
     );
     self[\build] = { |g, b|
         self[\grp] = g; self[\obus] = b;
@@ -349,7 +355,9 @@ s.options.memSize = 32768;
         self[\state][\gBus]   = Bus.audio(s, 2);      // glitch -> filter
         // group-tail order: slices(head) -> \glitchFx -> \djfilter -> engine bus
         ~breakGlitch = Synth.tail(g, \glitchFx, [\in, self[\state][\preBus].index, \out, self[\state][\gBus].index, \bpm, ~bpm]);
-        ~breakFilt   = Synth.tail(g, \djfilter, [\in, self[\state][\gBus].index, \out, b.index, \pos, ~djPos]);
+        self[\state][\vBus] = Bus.audio(s, 2);        // djfilter -> VCA
+        ~breakFilt = Synth.tail(g, \djfilter, [\in, self[\state][\gBus].index, \out, self[\state][\vBus].index, \pos, ~djPos]);
+        ~breakVca  = Synth.tail(g, \breakVca,  [\in, self[\state][\vBus].index, \out, b.index, \gain, 1]);
     };
     self[\step]  = { |step|
         var st = self[\state];
@@ -375,6 +383,7 @@ s.options.memSize = 32768;
         var st = self[\state];
         st[\recording] = false; st[\padOn] = false; st[\livePrs] = 0;
         st[\xActive] = false; st[\yActive] = false; st[\prsActive] = false;
+        st[\inCorner] = false; st[\killed] = false; st[\killEnterT] = 0;
     };
     // ---- looper sub-tick: SOLE writer of all break FX. Per lane: live-if-active-this-pass, else
     //      recorded-if-written, else base. Only ACTIVE lanes are written this pass (overdub-safe). ----
@@ -382,7 +391,7 @@ s.options.memSize = 32768;
         var st = self[\state];
         var ls = st[\loopSub];
         var rec = st[\recording];
-        var xv, yv, pv, pos;
+        var xv, yv, pv, pos, gain;
         if(rec and: { st[\xActive]   }) { st[\xLane][ls]   = st[\liveX]   };
         if(rec and: { st[\yActive]   }) { st[\yLane][ls]   = st[\liveY]   };
         if(rec and: { st[\prsActive] }) { st[\prsLane][ls] = st[\livePrs] };
@@ -398,8 +407,15 @@ s.options.memSize = 32768;
             if(~breakGlitch.notNil) { ~breakGlitch.set(\density, yv, \flavor, yv, \wet, pv) };
             st[\lastY] = yv; st[\lastWet] = pv;
         };
+        // M-C: kill-corner dwell (checked here so a parked-still finger still fires) + pressure-gate -> VCA gain
+        if(st[\inCorner] and: { st[\killEnterT] > 0 } and: { (Main.elapsedTime - st[\killEnterT]) > 0.1 }) { st[\killed] = true };
+        gain = if(st[\killed]) { 0.0 } { 1.0 };                // kill-corner is the silence; pressure-gate deferred (base conflict w/ wet)
+        if((gain - st[\lastGain]).abs > 0.002) {
+            if(~breakVca.notNil) { ~breakVca.set(\gain, gain) };
+            st[\lastGain] = gain;
+        };
         st[\dispX] = xv; st[\dispY] = yv; st[\wet] = pv;        // for the OLED dot + wet bar
-        if(~subPhase == 0) { ~tele.sendMsg("/loop", ls, pos.asFloat, yv.asFloat, pv.asFloat, if(rec, 1, 0)) };  // eyes
+        if(~subPhase == 0) { ~tele.sendMsg("/loop", ls, pos.asFloat, yv.asFloat, pv.asFloat, gain.asFloat, if(rec, 1, 0)) };  // eyes
     };
     self[\advance] = { self[\state][\loopSub] = (self[\state][\loopSub] + 1) % self[\state][\loopSubs] };
     self[\rotary] = { |idx, d|
@@ -433,13 +449,14 @@ s.options.memSize = 32768;
             st[\xActive] = false; st[\yActive] = false; st[\prsActive] = false;
             if(st[\xWritten].not)   { st[\xLane].fill(0.5) };   // pre-fill unwritten lanes with base so a partial
             if(st[\yWritten].not)   { st[\yLane].fill(0.0) };   // pass reads base, not newClear zeros
-            if(st[\prsWritten].not) { st[\prsLane].fill(0.0) };
+            if(st[\prsWritten].not) { st[\prsLane].fill(0.0) };  // prs base 0 (wet = dry at rest)
         } {                                                     // release: commit only the lanes that moved this pass
             st[\recording] = false; st[\livePrs] = 0;
             if(st[\xActive])   { st[\xWritten] = true };
             if(st[\yActive])   { st[\yWritten] = true };
             if(st[\prsActive]) { st[\prsWritten] = true };
             st[\xActive] = false; st[\yActive] = false; st[\prsActive] = false;
+            st[\inCorner] = false; st[\killed] = false; st[\killEnterT] = 0;  // finger up -> unmute
         };
         ~dirty = true;
     };
@@ -454,9 +471,13 @@ s.options.memSize = 32768;
     };
     self[\gridPos] = { |x, y|
         var st = self[\state];
+        var nowIn = (x < 1) and: { y < 1 } and: { st[\padOn] };  // bottom-left kill corner
         st[\liveX] = (x / 10).clip(0, 1);                       // sub-tick reads these; no direct .set
         st[\liveY] = (y / 10).clip(0, 1);
-        if(st[\recording]) {                                    // lazy baseline on first pos after touch (last pos is stale)
+        if(nowIn and: { st[\inCorner].not }) { st[\killEnterT] = Main.elapsedTime };  // just entered -> start dwell
+        if(nowIn.not) { st[\killed] = false; st[\killEnterT] = 0 };                   // left corner -> unmute
+        st[\inCorner] = nowIn;
+        if(st[\recording] and: { st[\killed].not }) {           // lazy baselines; don't imprint lanes while killing
             if(st[\xAtTouch].isNil) { st[\xAtTouch] = st[\liveX] };
             if(st[\yAtTouch].isNil) { st[\yAtTouch] = st[\liveY] };
             if((st[\liveX] - st[\xAtTouch]).abs > 0.03) { st[\xActive] = true };
@@ -575,6 +596,11 @@ s.waitForBoot({
     }).add;
 
     // sums the engine buses to the hardware out; per-engine level
+    // M-C gate/duck/kill VCA at the tail of the break chain. LagUD = punchy attack, click-free release.
+    SynthDef(\breakVca, { |in=0, out=0, gain=1|
+        Out.ar(out, In.ar(in, 2) * LagUD.kr(gain, 0.004, 0.02));
+    }).add;
+
     SynthDef(\mixer, { |voiceBus=0, breakBus=0, lvVoice=0.8, lvBreak=0.9|
         Out.ar(0, (In.ar(voiceBus, 2) * lvVoice) + (In.ar(breakBus, 2) * lvBreak));
     }).add;
@@ -682,6 +708,8 @@ s.waitForBoot({
         };
     }, '/link/state');
     OSCdef(\tuneLinkKp, { |msg| ~linkKp = msg[1].clip(0, 4); ("linkKp=" ++ ~linkKp).postln }, '/tune/linkkp');
+    OSCdef(\tuneGateFloor, { |msg| ~engines[1][\state][\gateFloor] = msg[1].clip(0, 0.5); ("gateFloor=" ++ msg[1]).postln }, '/tune/mm/gatefloor');
+    OSCdef(\tuneGateKnee,  { |msg| ~engines[1][\state][\gateKnee]  = msg[1].clip(0.1, 1.0); ("gateKnee=" ++ msg[1]).postln }, '/tune/mm/gateknee');
     OSCdef(\lvVoice,   { |msg| ~mixer.set(\lvVoice, msg[1].clip(0, 2)); ("lvVoice=" ++ msg[1]).postln }, '/tune/lvvoice');
     OSCdef(\lvBreak,   { |msg| ~mixer.set(\lvBreak, msg[1].clip(0, 2)); ("lvBreak=" ++ msg[1]).postln }, '/tune/lvbreak');
 
