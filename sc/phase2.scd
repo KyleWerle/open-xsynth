@@ -95,7 +95,7 @@ s.options.memSize = 32768;
 ~eng = { ~engines[~focus] };          // the focused engine
 ~menuUntil = 0; ~menuHold = 1.2;      // engine-select overlay timer
 ~stepIdx = 0;                         // master 16th-note step 0..15
-~subDiv = 4; ~subPhase = 0;           // looper sub-ticks per 16th -> 1/64-note automation resolution
+~subDiv = 2; ~subPhase = 0;           // looper sub-ticks per 16th -> 1/32 automation res (Pi 3 load; Lag smooths between)
 ~bpm = 110; ~clock = TempoClock(~bpm / 60);
 
 // ================= OLED focus/overlay system =================
@@ -328,7 +328,7 @@ s.options.memSize = 32768;
         // XY glitch-pad state: Y=mangle (density+flavor), pressure=wet, touch=engage
         padOn: false, wet: 0, density: 0, flavor: 0.5,
         // ---- looper (M-A/M-B): 3 smooth automation lanes @ subDiv=4; 1 bar = 64 sub-ticks ----
-        loopBars: 1, loopSubs: 64, loopSub: 0,
+        loopBars: 1, loopSubs: (16 * ~subDiv), loopSub: 0,      // 1 bar; tracks subDiv (=32 at 1/32)
         xLane:   FloatArray.newClear(256),       // X -> DJ-filter sweep   (base 0.5 = thru)
         yLane:   FloatArray.newClear(256),       // Y -> glitch mangle     (base 0)
         prsLane: FloatArray.newClear(256),       // pressure -> glitch wet (base 0)
@@ -702,13 +702,16 @@ s.waitForBoot({
     // ---- 45fps wall-clock loop: VOICE physics + detent spring-back + OLED blit ----
     ~physics = Routine({
         var dt = 1 / ~fps;
+        var lastOled = 0, oledDt = 0.05;                      // OLED redraw cap ~20fps -> frees the shared i2c bus for grid reads
         loop {
             var now = Main.elapsedTime;
-            ~tele.sendMsg("/tele", ~press.asFloat, ~lastStrike.asFloat, ~yTone.asFloat,
-                ~cutPos.asFloat, ~p.cutoff.asFloat,
-                (~p.cutoff * (2 ** ((~m.tBri * (~yTone - 0.5)) + (~m.pBri * ~press)))).clip(80, 14000).asFloat,
-                (~p.amp * (~m.ampFloor + (~press * ~m.pAmp))).asFloat,
-                if(~sounding, 1, 0));
+            if(~focus == 0) {                                 // /tele is VOICE play-state; skip its work during BREAK
+                ~tele.sendMsg("/tele", ~press.asFloat, ~lastStrike.asFloat, ~yTone.asFloat,
+                    ~cutPos.asFloat, ~p.cutoff.asFloat,
+                    (~p.cutoff * (2 ** ((~m.tBri * (~yTone - 0.5)) + (~m.pBri * ~press)))).clip(80, 14000).asFloat,
+                    (~p.amp * (~m.ampFloor + (~press * ~m.pAmp))).asFloat,
+                    if(~sounding, 1, 0));
+            };
             if(~cutVel.abs > ~velEps) {                       // VOICE inertial cutoff coast
                 ~cutPos = (~cutPos + (~cutVel * dt)).clip(0, 1);
                 if((~cutPos <= 0) or: { ~cutPos >= 1 }) { ~cutVel = 0 };
@@ -738,7 +741,7 @@ s.waitForBoot({
                 };
             };
             if(~focusParam.notNil and: { now >= ~focusUntil }) { ~focusParam = nil; ~dirty = true };
-            if(~dirty) { ~drawUI.(); ~dirty = false };
+            if(~dirty and: { (now - lastOled) >= oledDt }) { ~drawUI.(); ~dirty = false; lastOled = now };  // throttled blit
             dt.wait;
         };
     }).play(SystemClock);
